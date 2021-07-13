@@ -23,6 +23,7 @@ import java.io.InputStreamReader;
 import java.io.PrintStream;
 import java.io.Reader;
 import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.TreeMap;
 
@@ -31,19 +32,24 @@ public class FlameGraph {
     public boolean reverse;
     public double minwidth;
     public int skip;
-    public String input;
+    public boolean diff;
+    public String input1;
+    public String input2;
     public String output;
 
     private final Frame root = new Frame();
     private int depth;
     private long mintotal;
+    private double maxDiff;
 
     public FlameGraph(String... args) {
         for (int i = 0; i < args.length; i++) {
             String arg = args[i];
             if (!arg.startsWith("--") && !arg.isEmpty()) {
-                if (input == null) {
-                    input = arg;
+                if (input1 == null) {
+                    input1 = arg;
+                } else if (diff && input2 == null) {
+                    input2 = arg;
                 } else {
                     output = arg;
                 }
@@ -51,6 +57,8 @@ public class FlameGraph {
                 title = args[++i];
             } else if (arg.equals("--reverse")) {
                 reverse = true;
+            } else if (arg.equals("--diff")) {
+                diff = true;
             } else if (arg.equals("--minwidth")) {
                 minwidth = Double.parseDouble(args[++i]);
             } else if (arg.equals("--skip")) {
@@ -59,8 +67,14 @@ public class FlameGraph {
         }
     }
 
+
     public void parse() throws IOException {
-        parse(new InputStreamReader(new FileInputStream(input), StandardCharsets.UTF_8));
+        if (diff) {
+            parseDiff(new InputStreamReader(new FileInputStream(input1), StandardCharsets.UTF_8),
+                new InputStreamReader(new FileInputStream(input2), StandardCharsets.UTF_8));
+        } else {
+            parse(new InputStreamReader(new FileInputStream(input1), StandardCharsets.UTF_8));
+        }
     }
 
     public void parse(Reader in) throws IOException {
@@ -71,12 +85,49 @@ public class FlameGraph {
 
                 String[] trace = line.substring(0, space).split(";");
                 long ticks = Long.parseLong(line.substring(space + 1));
-                addSample(trace, ticks);
+                addSample(trace, ticks, 0);
             }
         }
     }
 
-    public void addSample(String[] trace, long ticks) {
+    public void parseDiff(Reader in1, Reader in2) throws IOException {
+        Map<String, long[]> data = new HashMap<String, long[]>();
+
+        try (BufferedReader br1 = new BufferedReader(in1)) {
+            for (String line; (line = br1.readLine()) != null; ) {
+                int space = line.lastIndexOf(' ');
+                if (space <= 0) continue;
+                String trace = line.substring(0, space);
+                long ticks = Long.parseLong(line.substring(space + 1));
+                if (data.containsKey(trace)) {
+                    data.put(trace, new long[] {data.get(trace)[0] + ticks, 0});
+                } else {
+                    data.put(trace, new long[] {ticks, 0});
+                }
+            }
+        }
+        try (BufferedReader br2 = new BufferedReader(in2)) {
+            for (String line; (line = br2.readLine()) != null; ) {
+                int space = line.lastIndexOf(' ');
+                if (space <= 0) continue;
+                String trace = line.substring(0, space);
+                long ticks = Long.parseLong(line.substring(space + 1));
+                if (data.containsKey(trace)) {
+                    data.put(trace, new long[] {data.get(trace)[0], data.get(trace)[1] + ticks});
+                } else {
+                    data.put(trace, new long[] {0, ticks});
+                }
+            }
+        }
+
+        for (String trace : data.keySet()) {
+            addSample(trace.split(";"), data.get(trace)[0], data.get(trace)[1]);
+        }
+
+        calculateDiff(root);
+    }
+
+    public void addSample(String[] trace, long ticks, long comparison) {
         Frame frame = root;
         if (reverse) {
             for (int i = trace.length; --i >= skip; ) {
@@ -86,14 +137,17 @@ public class FlameGraph {
         } else {
             for (int i = skip; i < trace.length; i++) {
                 frame.total += ticks;
+                frame.comparison += comparison;
                 frame = frame.child(trace[i]);
             }
         }
         frame.total += ticks;
         frame.self += ticks;
+        frame.comparison += comparison;
 
         depth = Math.max(depth, trace.length);
     }
+
 
     public void dump() throws IOException {
         if (output == null) {
@@ -106,12 +160,24 @@ public class FlameGraph {
         }
     }
 
+    public void calculateDiff(Frame frame) {
+        frame.diff = ((double) frame.total / (double) root.total) -  ((double) frame.comparison / (double) root.comparison);
+        maxDiff = Math.max(Math.abs(frame.diff), maxDiff);
+
+        for (Map.Entry<String, Frame> e : frame.entrySet()) {
+            Frame child = e.getValue();
+            calculateDiff(child);
+        }
+    }
+
     public void dump(PrintStream out) {
         out.print(applyReplacements(HEADER,
-                "{title}", title,
-                "{height}", (depth + 1) * 16,
-                "{depth}", depth + 1,
-                "{reverse}", reverse));
+            "{title}", title,
+            "{height}", (depth + 1) * 16,
+            "{depth}", depth + 1,
+            "{reverse}", reverse,
+            "{diff}", diff,
+            "{maxDiff}", Double.toString(maxDiff)));
 
         mintotal = (long) (root.total * minwidth / 100);
         printFrame(out, "all", root, 0, 0);
@@ -140,6 +206,7 @@ public class FlameGraph {
         return result.toString();
     }
 
+
     private void printFrame(PrintStream out, String title, Frame frame, int level, long x) {
         int type = frameType(title);
         title = stripSuffix(title);
@@ -147,9 +214,10 @@ public class FlameGraph {
             title = title.replace("'", "\\'");
         }
 
-        out.println("f(" + level + "," + x + "," + frame.total + "," + type + ",'" + title + "')");
+        out.println("f(" + level + "," + x + "," + frame.total + "," + type + "," + frame.diff + "," + frame.comparison + ",'" + title + "')");
 
         x += frame.self;
+
         for (Map.Entry<String, Frame> e : frame.entrySet()) {
             Frame child = e.getValue();
             if (child.total >= mintotal) {
@@ -185,12 +253,13 @@ public class FlameGraph {
 
     public static void main(String[] args) throws IOException {
         FlameGraph fg = new FlameGraph(args);
-        if (fg.input == null) {
-            System.out.println("Usage: java " + FlameGraph.class.getName() + " [options] input.collapsed [output.html]");
+        if (fg.input1 == null | fg.diff && fg.input2 == null) {
+            System.out.println("Usage: java " + FlameGraph.class.getName() + " [options] input1.collapsed input2.collapsed [output.html]");
             System.out.println();
             System.out.println("Options:");
             System.out.println("  --title TITLE");
             System.out.println("  --reverse");
+            System.out.println("  --diff");
             System.out.println("  --minwidth PERCENT");
             System.out.println("  --skip FRAMES");
             System.exit(1);
@@ -203,6 +272,8 @@ public class FlameGraph {
     static class Frame extends TreeMap<String, Frame> {
         long total;
         long self;
+        long comparison;
+        double diff;
 
         Frame child(String title) {
             Frame child = get(title);
@@ -211,6 +282,7 @@ public class FlameGraph {
             }
             return child;
         }
+
     }
 
     private static final String HEADER = "<!DOCTYPE html>\n" +
@@ -226,7 +298,7 @@ public class FlameGraph {
             "\ta {color: #0366d6}\n" +
             "\t#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}\n" +
             "\t#hl span {padding: 0 3px 0 3px}\n" +
-            "\t#status {overflow: hidden; white-space: nowrap}\n" +
+            "\t#status {overflow: hidden; white-space: nowrap; position: fixed; background: white; right: 0; top: 0; padding: 10px;}\n" +
             "\t#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}\n" +
             "\t#reset {cursor: pointer}\n" +
             "</style>\n" +
@@ -276,8 +348,19 @@ public class FlameGraph {
             "\t\treturn '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);\n" +
             "\t}\n" +
             "\n" +
-            "\tfunction f(level, left, width, type, title) {\n" +
-            "\t\tlevels[level].push({left: left, width: width, color: getColor(palette[type]), title: title});\n" +
+            "\tfunction getDiffColor(diff, comparison) {\n" +
+            "\tif (comparison === 0) {\n" +
+            "\t\treturn 'GoldenRod'\n" +
+            "\t} else if (diff > 0) {\n" +
+            "\t\treturn 'rgba(255, 0, 0, ' + diff / ${maxDiff} + ')'\n" +
+            "\t} else if (diff < 0) {\n" +
+            "\t\treturn 'rgba(0, 0, 255, ' + Math.abs(diff) / ${maxDiff} + ')'\n" +
+            "\t} else {\n" +
+            "\t\treturn 'LightGrey'}\n" +
+            "\t}\n" +
+            "\n" +
+            "\tfunction f(level, left, width, type, diff, comparison, title) {\n" +
+            "\t\tlevels[level].push({left: left, width: width, type: type, comparison: comparison, color: ${diff} ? getDiffColor(diff, comparison) : getColor(palette[type]), diff: diff, title: title});\n" +
             "\t}\n" +
             "\n" +
             "\tfunction samples(n) {\n" +
@@ -392,7 +475,8 @@ public class FlameGraph {
             "\t\t\t\thl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';\n" +
             "\t\t\t\thl.firstChild.textContent = f.title;\n" +
             "\t\t\t\thl.style.display = 'block';\n" +
-            "\t\t\t\tcanvas.title = f.title + '\\n(' + samples(f.width) + ', ' + pct(f.width, levels[0][0].width) + '%)';\n" +
+            "\t\t\t\tcanvas.title = ${diff} ? f.title + '\\n(' + samples(f.width) + ' VS ' + f.comparison + ', DIFF = ' + f.diff + ')'\n" +
+            "\t\t\t\t\t: f.title + '\\n(' + samples(f.width) + ', ' + pct(f.width, levels[0][0].width) + '%)';\n" +
             "\t\t\t\tcanvas.style.cursor = 'pointer';\n" +
             "\t\t\t\tcanvas.onclick = function() {\n" +
             "\t\t\t\t\tif (f != root) {\n" +

@@ -70,7 +70,7 @@ public class jfr2flame {
                     for (int i = 0; i < methods.length; i++) {
                         trace[--idx] = getMethodName(methods[i], types[i]);
                     }
-                    fg.addSample(trace, value);
+                    fg.addSample(trace, value, 0);
                 }
             }
         });
@@ -160,7 +160,7 @@ public class jfr2flame {
 
     public static void main(String[] args) throws Exception {
         FlameGraph fg = new FlameGraph(args);
-        if (fg.input == null) {
+        if (fg.input1 == null) {
             System.out.println("Usage: java " + jfr2flame.class.getName() + " [options] input.jfr [output.html]");
             System.out.println();
             System.out.println("options include all supported FlameGraph options, plus the following:");
@@ -184,7 +184,7 @@ public class jfr2flame {
             eventClass = ExecutionSample.class;
         }
 
-        try (JfrReader jfr = new JfrReader(fg.input)) {
+        try (JfrReader jfr = new JfrReader(fg.input1)) {
             new jfr2flame(jfr).convert(fg, threads, total, eventClass);
         }
 
